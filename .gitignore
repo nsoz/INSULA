@@ -1,2 +1,17 @@
 /target
 .DS_Store
+
+# Design/process docs — kept locally for session continuity (STATUS.md is
+# read at the start of every Claude session), not part of the public
+# repo face. The root README is the one exception, once it exists.
+*.md
+!/README.md
+
+# Secrets — never commit API keys/credentials (e.g. the Claude API key
+# once that integration exists). Same convention already used for
+# INSULA_SAFE_BROWSING_API_KEY: read from the environment, never hardcoded
+# or checked in.
+.env
+.env.*
+*.pem
+*.key

@@ -32,10 +32,18 @@ use insula::cli::command_line::CommandLine;
 use insula::cli::kitty_mark::KittyMark;
 use insula::cli::notify::Notifications;
 use insula::cli::onboarding::{Answers, ExplorationMode, Onboarding};
+use insula::vm::RunningVm;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::{Frame, Terminal};
 use ratatui_image::picker::{Picker, ProtocolType};
+
+/// Name of the Tart VM clone Insula boots for analysis — currently a
+/// fixed, pre-cloned instance (`tart clone
+/// ghcr.io/cirruslabs/macos-tahoe-base:latest insula-macos`); a real
+/// clone-per-run lifecycle is later Milestone-3 work, see
+/// `project-insula-vm-tooling` memory.
+const VM_NAME: &str = "insula-macos";
 
 /// How long each notification line stays as the animated "current" one
 /// before the next one takes over.
@@ -198,6 +206,71 @@ fn find_kitty_binary() -> Option<std::path::PathBuf> {
     app_bundle.exists().then(|| app_bundle.to_path_buf())
 }
 
+/// Tracks the real (not simulated) `tart run` launch of the analysis VM,
+/// polled once per tick until Tart reports either a VNC URL or the
+/// process fails outright. Flat rather than an enum with `RunningVm`
+/// embedded in variants — mutating a single field in place each tick is
+/// simpler than moving `RunningVm` (which owns a `Child` and can't be
+/// cloned) between enum variants.
+struct VmLaunch {
+    vm: Option<RunningVm>,
+    vnc_url: Option<String>,
+    error: Option<String>,
+}
+
+impl VmLaunch {
+    fn launch(vm_name: &str, app_path: &std::path::Path, mode: ExplorationMode) -> Self {
+        let auto_open_vnc = matches!(mode, ExplorationMode::Manual);
+        match RunningVm::launch(vm_name, app_path, auto_open_vnc) {
+            Ok(vm) => Self {
+                vm: Some(vm),
+                vnc_url: None,
+                error: None,
+            },
+            Err(e) => Self {
+                vm: None,
+                vnc_url: None,
+                error: Some(e.to_string()),
+            },
+        }
+    }
+
+    /// Whether the launch has resolved one way or another (VNC ready, or
+    /// failed) — while this is `false`, the notification sequence holds
+    /// on the first message rather than advancing on a timer, since this
+    /// step is now real instead of simulated.
+    fn resolved(&self) -> bool {
+        self.vnc_url.is_some() || self.error.is_some()
+    }
+
+    fn poll(&mut self) {
+        if self.resolved() {
+            return;
+        }
+        if let Some(vm) = &self.vm
+            && let Some(url) = vm.poll_vnc_url()
+        {
+            self.vnc_url = Some(url);
+        }
+    }
+
+    /// What the first notification line should actually say, reflecting
+    /// real status instead of the static placeholder text the rest of the
+    /// sequence still uses. The app is already staged and shared into the
+    /// VM by the time `tart run` is spawned (see `vm::RunningVm::launch`),
+    /// so there's no separate "transferring" step to report once this
+    /// resolves — it's already true.
+    fn status_line(&self) -> String {
+        match (&self.vnc_url, &self.error) {
+            (Some(url), _) => {
+                format!("VM açıldı, uygulama paylaşımlı dizin üzerinden erişilebilir — VNC: {url}")
+            }
+            (None, Some(err)) => format!("VM açılamadı: {err}"),
+            (None, None) => "VM açılıyor, uygulama VM'e aktarılıyor...".to_string(),
+        }
+    }
+}
+
 /// Where the session is in the fake end-to-end flow this prototype drives:
 /// onboarding's 3 questions, then a small notification ticker standing in
 /// for "VM opening / app transferring / exploring", then the placeholder
@@ -238,10 +311,16 @@ fn run(
 ) -> anyhow::Result<()> {
     let mut command_line = CommandLine::default();
     let mut stage = Stage::Onboarding(Onboarding::default());
+    // Lives for the rest of the process, not just `Stage::Notifying` — a
+    // `Stage` transition used to drop this along with the old variant,
+    // which (via `RunningVm`'s `Drop`) killed the VM the moment the
+    // notification sequence finished, seconds after it opened. Scoping it
+    // here instead means it only tears down when `run` itself returns.
+    let mut vm: Option<VmLaunch> = None;
 
     loop {
         watermark.poll_resize_result();
-        advance_stage(&mut stage, &mut command_line);
+        advance_stage(&mut stage, &mut vm, &mut command_line);
 
         terminal.draw(|frame| {
             let area = frame.area();
@@ -261,16 +340,35 @@ fn run(
                     spinner_tick,
                     ..
                 } => {
+                    let Some(vm) = &vm else { return };
                     let [watermark_area, panel_area] = Layout::vertical([
                         Constraint::Min(0),
                         Constraint::Length(insula::cli::notify::HEIGHT),
                     ])
                     .areas(area);
                     watermark.render(frame, watermark_area);
-                    let shown = (*shown).min(messages.len());
+
+                    // Index 0 is the real VM-launch status line
+                    // (`vm.status_line()`), not a canned string like the
+                    // rest of `messages` — see `VmLaunch`.
+                    let total = messages.len() + 1;
+                    let shown = (*shown).min(total);
+                    let mut past: Vec<String> = Vec::new();
+                    if shown >= 1 {
+                        past.push(vm.status_line());
+                    }
+                    if shown >= 2 {
+                        past.extend(messages[..shown - 1].iter().cloned());
+                    }
+                    let current = if shown == 0 {
+                        Some(vm.status_line())
+                    } else {
+                        messages.get(shown - 1).cloned()
+                    };
+
                     Notifications {
-                        past: &messages[..shown],
-                        current: messages.get(shown).map(String::as_str),
+                        past: &past,
+                        current: current.as_deref(),
                         spinner_tick: *spinner_tick,
                     }
                     .render(frame, panel_area);
@@ -288,11 +386,9 @@ fn run(
                     // `CommandLine::needed_height`.
                     let max_flow_height = (area.height * 7) / 10;
                     let flow_height = command_line.needed_height(max_flow_height);
-                    let [watermark_area, command_line_area] = Layout::vertical([
-                        Constraint::Min(0),
-                        Constraint::Length(flow_height),
-                    ])
-                    .areas(area);
+                    let [watermark_area, command_line_area] =
+                        Layout::vertical([Constraint::Min(0), Constraint::Length(flow_height)])
+                            .areas(area);
 
                     watermark.render(frame, watermark_area);
                     command_line.render(frame, command_line_area);
@@ -314,6 +410,11 @@ fn run(
                         Stage::Onboarding(onboarding) => {
                             if let Some(answers) = onboarding.handle_key(key) {
                                 let messages = notification_messages(&answers);
+                                vm = Some(VmLaunch::launch(
+                                    VM_NAME,
+                                    std::path::Path::new(&answers.path),
+                                    answers.mode,
+                                ));
                                 stage = Stage::Notifying {
                                     answers,
                                     messages,
@@ -345,7 +446,7 @@ fn run(
 /// history, and moving to the next stage once each phase runs out of
 /// content. Split from rendering so the borrow of whichever `Stage` variant
 /// is active never overlaps with reassigning `*stage` itself.
-fn advance_stage(stage: &mut Stage, command_line: &mut CommandLine) {
+fn advance_stage(stage: &mut Stage, vm: &mut Option<VmLaunch>, command_line: &mut CommandLine) {
     match stage {
         Stage::Notifying {
             messages,
@@ -355,7 +456,14 @@ fn advance_stage(stage: &mut Stage, command_line: &mut CommandLine) {
             ..
         } => {
             *spinner_tick = spinner_tick.wrapping_add(1);
-            if *shown < messages.len() && last_tick.elapsed() >= NOTIFY_INTERVAL {
+            let Some(vm) = vm else { return };
+            vm.poll();
+            // Index 0 (the real VM-launch line) only advances once the
+            // launch has actually resolved — everything after it is still
+            // timer-based placeholder text.
+            let can_advance = *shown > 0 || vm.resolved();
+            let total = messages.len() + 1;
+            if can_advance && *shown < total && last_tick.elapsed() >= NOTIFY_INTERVAL {
                 *shown += 1;
                 *last_tick = Instant::now();
             }
@@ -389,11 +497,11 @@ fn advance_stage(stage: &mut Stage, command_line: &mut CommandLine) {
         Stage::Onboarding(_) | Stage::Interactive => {}
     }
 
-    let notifying_done =
-        matches!(stage, Stage::Notifying { messages, shown, .. } if *shown >= messages.len());
-    if notifying_done
-        && let Stage::Notifying { answers, .. } = stage
-    {
+    let notifying_done = matches!(
+        stage,
+        Stage::Notifying { messages, shown, .. } if *shown > messages.len()
+    );
+    if notifying_done && let Stage::Notifying { answers, .. } = stage {
         let remaining_lines: VecDeque<String> = build_report_lines(answers).into();
         *stage = Stage::Streaming {
             remaining_lines,
@@ -413,13 +521,12 @@ fn advance_stage(stage: &mut Stage, command_line: &mut CommandLine) {
     }
 }
 
-/// The fake "VM opening / transferring / exploring" status lines shown
-/// while `Stage::Notifying` is active — standing in for the real Milestone
-/// 3/4 pipeline, which doesn't exist yet.
+/// The fake "exploring" status line shown after the real VM-launch line
+/// (`VmLaunch::status_line`, which already covers the app transfer — see
+/// its docs) while `Stage::Notifying` is active — standing in for the
+/// real Milestone 4 exploration pipeline, which doesn't exist yet.
 fn notification_messages(answers: &Answers) -> Vec<String> {
     vec![
-        "VM açılıyor...".to_string(),
-        format!("\"{}\" VM'e aktarılıyor...", answers.path),
         match answers.mode {
             ExplorationMode::Manual => {
                 "VM hazır — uygulamayı VM içinde kendiniz keşfedebilirsiniz.".to_string()
@@ -452,51 +559,67 @@ fn build_report_lines(answers: &Answers) -> Vec<String> {
         "Toplam gözlem süresi: 00:04:37".to_string(),
         String::new(),
         "-- Özet --".to_string(),
-        "Uygulama başlangıçta beklenen dosya/dizin erişimlerini yaptı; ardından amacıyla".to_string(),
-        "doğrudan ilişkisi görünmeyen birkaç sistem sorgusu ve bir ağ bağlantı denemesi".to_string(),
-        "gözlemlendi. Aşağıdaki zaman çizelgesi ve anomali bölümü bunları ayrı ayrı listeliyor.".to_string(),
+        "Uygulama başlangıçta beklenen dosya/dizin erişimlerini yaptı; ardından amacıyla"
+            .to_string(),
+        "doğrudan ilişkisi görünmeyen birkaç sistem sorgusu ve bir ağ bağlantı denemesi"
+            .to_string(),
+        "gözlemlendi. Aşağıdaki zaman çizelgesi ve anomali bölümü bunları ayrı ayrı listeliyor."
+            .to_string(),
         String::new(),
         "-- Statik Yapı Profili --".to_string(),
         "Dosya türü: Mach-O 64-bit executable (arm64)".to_string(),
         "İmzalama: ad-hoc, tanınan bir yayıncı sertifikası yok.".to_string(),
         "Entitlement'lar: com.apple.security.network.client, sandbox devre dışı.".to_string(),
-        "Bölüm entropisi: __TEXT 5.9, __DATA 4.1, __LINKEDIT 6.2 — paketleme belirtisi yok.".to_string(),
+        "Bölüm entropisi: __TEXT 5.9, __DATA 4.1, __LINKEDIT 6.2 — paketleme belirtisi yok."
+            .to_string(),
         "Bağlı kütüphaneler: libSystem, CoreFoundation, Security, libcurl.".to_string(),
-        "Gömülü stringler arasında 2 URL, 1 API anahtarı benzeri yüksek entropili dizgi var.".to_string(),
+        "Gömülü stringler arasında 2 URL, 1 API anahtarı benzeri yüksek entropili dizgi var."
+            .to_string(),
         String::new(),
         "-- Davranış Zaman Çizelgesi --".to_string(),
         "00:00:02  Süreç başlatıldı, ana thread çalışmaya başladı.".to_string(),
-        "00:00:03  Dosya: kendi bulunduğu dizini okudu (kod imzası doğrulama olabilir).".to_string(),
+        "00:00:03  Dosya: kendi bulunduğu dizini okudu (kod imzası doğrulama olabilir)."
+            .to_string(),
         "00:00:05  Sistem: toplam çalışma süresi (uptime) sorgulandı.".to_string(),
         "00:00:07  Dosya: kullanıcının Belgeler klasörü listelendi.".to_string(),
-        "00:00:09  Dosya: Masaüstü klasörü listelendi (uygulamanın amacıyla ilişkisi belirsiz).".to_string(),
-        "00:00:12  Süreç: adı bilinmeyen bir yardımcı süreç başlatıldı, kısa sürede sonlandı.".to_string(),
+        "00:00:09  Dosya: Masaüstü klasörü listelendi (uygulamanın amacıyla ilişkisi belirsiz)."
+            .to_string(),
+        "00:00:12  Süreç: adı bilinmeyen bir yardımcı süreç başlatıldı, kısa sürede sonlandı."
+            .to_string(),
         "00:00:18  Ağ: dış bir sunucuya bağlantı denemesi (yanıt yok, VM izole).".to_string(),
-        "00:00:26  Sistem: yüklü uygulamalar listesi sorgulandı (VM/analiz araçları dahil).".to_string(),
+        "00:00:26  Sistem: yüklü uygulamalar listesi sorgulandı (VM/analiz araçları dahil)."
+            .to_string(),
         "00:00:41  Dosya: geçici dizine küçük bir dosya yazıldı, ardından silindi.".to_string(),
         "00:01:03  Süreç kendi çalışma sayacını (run-count) okudu, artırdı, kapattı.".to_string(),
         String::new(),
         "-- Anomali / Kaçınma Sinyalleri --".to_string(),
-        "[dikkat] Yüklü uygulama taraması, bilinen sanallaştırma/analiz araçlarının adlarını".to_string(),
+        "[dikkat] Yüklü uygulama taraması, bilinen sanallaştırma/analiz araçlarının adlarını"
+            .to_string(),
         "         içeriyordu — VM tespiti amaçlı olabilir.".to_string(),
-        "[dikkat] Çalışma sayacı okuma+artırma döngüsü, gecikmeli tetikleyici (delayed-trigger)".to_string(),
+        "[dikkat] Çalışma sayacı okuma+artırma döngüsü, gecikmeli tetikleyici (delayed-trigger)"
+            .to_string(),
         "         davranışıyla tutarlı; bu oturumda payload tetiklenmedi.".to_string(),
-        "[bilgi]  Masaüstü klasörü taraması, uygulamanın belirttiği amaçla doğrudan ilişkili".to_string(),
+        "[bilgi]  Masaüstü klasörü taraması, uygulamanın belirttiği amaçla doğrudan ilişkili"
+            .to_string(),
         "         görünmüyor — amaç dışı numaralandırma (irrelevant enumeration).".to_string(),
         String::new(),
         "-- Bilinen Desen Eşleşmeleri --".to_string(),
-        "Yüksek entropili gömülü dizgi, bilinen bir ticari çökme-raporlama SDK'sının anahtar".to_string(),
+        "Yüksek entropili gömülü dizgi, bilinen bir ticari çökme-raporlama SDK'sının anahtar"
+            .to_string(),
         "biçimiyle kısmen örtüşüyor (orta güven).".to_string(),
         String::new(),
         "-- Çıkarılan Yapı Taslağı (deneysel) --".to_string(),
-        "[doğrulanmış]  Ağ bağlantı denemesi sabit bir host:port çiftine yapılıyor — 3 farklı".to_string(),
+        "[doğrulanmış]  Ağ bağlantı denemesi sabit bir host:port çiftine yapılıyor — 3 farklı"
+            .to_string(),
         "               girdiyle tekrarlanan testte davranış değişmedi.".to_string(),
         "[çıkarım]      Çalışma sayacı belirli bir eşiği geçtiğinde ek bir davranışın".to_string(),
         "               tetiklenebileceği düşünülüyor; bu oturumda doğrulanamadı.".to_string(),
         String::new(),
         "-- Not --".to_string(),
-        "Bu gerçek bir VM oturumu değil; CLI akışını göstermek için yer tutucu bir örnek".to_string(),
-        "rapordur. Gerçek gözlem/rapor motoru Milestone 3-6 kapsamında henüz yazılmadı.".to_string(),
+        "Bu gerçek bir VM oturumu değil; CLI akışını göstermek için yer tutucu bir örnek"
+            .to_string(),
+        "rapordur. Gerçek gözlem/rapor motoru Milestone 3-6 kapsamında henüz yazılmadı."
+            .to_string(),
         String::new(),
         "Bu kanıtlarla ilgili sorularınızı aşağıya yazabilirsiniz.".to_string(),
     ]

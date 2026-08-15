@@ -226,7 +226,10 @@ mod tests {
     #[test]
     fn tilde_prefix_expands_to_home() {
         let home = std::env::var("HOME").unwrap();
-        assert_eq!(expand("~/Downloads/App.app"), Path::new(&home).join("Downloads/App.app"));
+        assert_eq!(
+            expand("~/Downloads/App.app"),
+            Path::new(&home).join("Downloads/App.app")
+        );
         assert_eq!(expand("~"), PathBuf::from(&home));
         assert_eq!(expand("/tmp/App.app"), PathBuf::from("/tmp/App.app"));
     }

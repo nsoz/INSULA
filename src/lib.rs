@@ -6,6 +6,7 @@ pub mod file_type_risk;
 pub mod local_signature;
 pub mod static_analysis;
 pub mod url_reputation;
+pub mod vm;
 
 use std::path::PathBuf;
 use std::time::SystemTime;

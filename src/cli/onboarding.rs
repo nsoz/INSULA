@@ -34,8 +34,12 @@ enum Step {
     /// `error` holds the reason the last submitted path was rejected (see
     /// `app_target::validate`) — cleared as soon as the user edits the
     /// input again, so it never lingers past the text that caused it.
-    Path { error: Option<String> },
-    Mode { selected: ExplorationMode },
+    Path {
+        error: Option<String>,
+    },
+    Mode {
+        selected: ExplorationMode,
+    },
 }
 
 pub struct Onboarding {
@@ -197,10 +201,7 @@ impl Onboarding {
         if matches!(self.step, Step::Path { .. }) {
             let cursor_x = area.x + 2 + self.input.chars().count() as u16;
             let cursor_y = area.y + 2;
-            frame.set_cursor_position((
-                cursor_x.min(area.right().saturating_sub(1)),
-                cursor_y,
-            ));
+            frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), cursor_y));
         }
     }
 }
