@@ -9,6 +9,16 @@
 //! which does *not* expose this because UTM's own process is the owner
 //! there instead).
 //!
+//! Every real analysis clones a fresh, disposable VM from the *golden*
+//! image (`insula_setup`'s prepared `insula-macos` — SIP already
+//! disabled, the ESF sensor already installed) rather than running the
+//! golden image directly: the golden image has to stay pristine and
+//! reusable indefinitely, and `PROJECT.md`'s safety guarantee is that
+//! nothing persists between analysis runs, which only holds if each run
+//! gets a genuinely fresh instance. Tart's clone is APFS-clonefile-based
+//! (near-instant, cheap copy-on-write), so this costs a run essentially
+//! nothing over running the golden image directly.
+//!
 //! Tart prints a `VNC server is running at vnc://...` line to stdout once
 //! the VM has booted and its VNC server is ready — booting a macOS guest
 //! takes tens of seconds, so that line is read on a background thread and
@@ -39,13 +49,18 @@ pub struct RunningVm {
     child: Child,
     vnc_ready: Receiver<String>,
     staging_dir: PathBuf,
+    /// Name of the disposable per-run clone — never the golden image
+    /// itself — deleted in `Drop` once this run is over.
+    ephemeral_vm_name: String,
 }
 
 impl RunningVm {
-    /// Spawns `tart run <vm_name> --no-graphics --vnc-experimental --dir
-    /// insula-app:<staging>:ro`, after first copying `app_path` into a
-    /// fresh staging directory. Fails immediately if staging the app, or
-    /// spawning `tart` itself, fails — does not wait for the VM to
+    /// Clones `golden_vm_name` (the `insula_setup`-prepared image) into a
+    /// fresh, uniquely-named disposable instance, then spawns `tart run
+    /// <clone> --no-graphics --vnc-experimental --dir insula-app:<staging>:ro`
+    /// against that clone — after first copying `app_path` into a fresh
+    /// staging directory. Fails immediately if cloning, staging the app,
+    /// or spawning `tart` itself fails — does not wait for the VM to
     /// actually finish booting.
     ///
     /// `auto_open_vnc` should be `true` only for manual exploration, where
@@ -53,14 +68,37 @@ impl RunningVm {
     /// themselves once it's ready — for Claude-driven exploration, Claude
     /// is the one connecting over VNC, so there's no reason to also pop
     /// open a visible Screen Sharing window for the user.
-    pub fn launch(vm_name: &str, app_path: &Path, auto_open_vnc: bool) -> std::io::Result<Self> {
+    pub fn launch(
+        golden_vm_name: &str,
+        app_path: &Path,
+        auto_open_vnc: bool,
+    ) -> std::io::Result<Self> {
         let staging_dir = stage_app_for_transfer(app_path)?;
         let dir_arg = format!("{SHARE_TAG}:{}:ro", staging_dir.display());
+
+        let ephemeral_vm_name = format!(
+            "insula-run-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+
+        let clone_status = Command::new("tart")
+            .args(["clone", golden_vm_name, &ephemeral_vm_name])
+            .status()?;
+        if !clone_status.success() {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(std::io::Error::other(format!(
+                "tart clone {golden_vm_name} -> {ephemeral_vm_name} failed"
+            )));
+        }
 
         let mut child = Command::new("tart")
             .args([
                 "run",
-                vm_name,
+                &ephemeral_vm_name,
                 "--no-graphics",
                 "--vnc-experimental",
                 "--dir",
@@ -96,6 +134,7 @@ impl RunningVm {
             child,
             vnc_ready: rx,
             staging_dir,
+            ephemeral_vm_name,
         })
     }
 
@@ -108,14 +147,24 @@ impl RunningVm {
 }
 
 impl Drop for RunningVm {
-    /// Never leave an analysis VM running, or its staged copy of the
-    /// submitted app sitting on disk, once Insula stops watching it —
-    /// matches `PROJECT.md`'s safety guarantee that nothing persists
-    /// between runs.
+    /// Never leave an analysis VM running, its disposable clone sitting
+    /// around, or its staged copy of the submitted app on disk, once
+    /// Insula stops watching it — matches `PROJECT.md`'s safety guarantee
+    /// that nothing persists between runs. `tart stop` before `delete` is
+    /// belt-and-suspenders: `child.kill()` should already tear the VM
+    /// down immediately (its `VZVirtualMachine` lives in that process),
+    /// but giving Tart an explicit stop first avoids a `delete` racing a
+    /// not-quite-finished teardown.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.staging_dir);
+        let _ = Command::new("tart")
+            .args(["stop", &self.ephemeral_vm_name])
+            .status();
+        let _ = Command::new("tart")
+            .args(["delete", &self.ephemeral_vm_name])
+            .status();
     }
 }
 

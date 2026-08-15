@@ -21,6 +21,10 @@ crossterm = "0.29.0"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 image = "0.25.10"
 base64-simd = "0.8"
+block2 = "0.6"
+
+[build-dependencies]
+bindgen = "0.72"
 
 # `cargo run`'s default dev profile leaves numeric code fully unoptimized,
 # and Lanczos3 resampling + PNG encoding (used to redraw the CLI background

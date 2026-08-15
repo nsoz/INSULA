@@ -38,12 +38,12 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::{Frame, Terminal};
 use ratatui_image::picker::{Picker, ProtocolType};
 
-/// Name of the Tart VM clone Insula boots for analysis — currently a
-/// fixed, pre-cloned instance (`tart clone
-/// ghcr.io/cirruslabs/macos-tahoe-base:latest insula-macos`); a real
-/// clone-per-run lifecycle is later Milestone-3 work, see
-/// `project-insula-vm-tooling` memory.
-const VM_NAME: &str = "insula-macos";
+/// Name of the golden, `insula_setup`-prepared image (SIP already
+/// disabled, the ESF sensor already installed — see
+/// `project-insula-vm-tooling` memory) that every real analysis clones a
+/// fresh, disposable instance from. Never run directly — see
+/// `vm::RunningVm::launch`.
+const GOLDEN_VM_NAME: &str = "insula-macos";
 
 /// How long each notification line stays as the animated "current" one
 /// before the next one takes over.
@@ -411,7 +411,7 @@ fn run(
                             if let Some(answers) = onboarding.handle_key(key) {
                                 let messages = notification_messages(&answers);
                                 vm = Some(VmLaunch::launch(
-                                    VM_NAME,
+                                    GOLDEN_VM_NAME,
                                     std::path::Path::new(&answers.path),
                                     answers.mode,
                                 ));
