@@ -1,0 +1,39 @@
+[package]
+name = "insula"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+notify = "6"
+xattr = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+infer = "0.16"
+anyhow = "1"
+zip = "0.6"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+image = "0.25.10"
+base64-simd = "0.8"
+
+# `cargo run`'s default dev profile leaves numeric code fully unoptimized,
+# and Lanczos3 resampling + PNG encoding (used to redraw the CLI background
+# mark on every terminal resize) is 20-30x slower under that than release —
+# multiple seconds per resize instead of well under 200ms. Opting just the
+# image-processing dependencies into release-level codegen keeps `insula`'s
+# own recompiles fast while making that redraw path fast in `cargo run` too.
+[profile.dev.package]
+image = { opt-level = 3 }
+png = { opt-level = 3 }
+miniz_oxide = { opt-level = 3 }
+fdeflate = { opt-level = 3 }
+crc32fast = { opt-level = 3 }
+simd-adler32 = { opt-level = 3 }
+adler2 = { opt-level = 3 }
+ratatui-image = { opt-level = 3 }
