@@ -79,20 +79,28 @@ pub fn validate(path: &Path) -> Result<(), AppTargetError> {
 
 #[cfg(target_os = "macos")]
 fn is_runnable(path: &Path) -> bool {
-    if path.is_dir() {
-        return path.extension().is_some_and(|ext| ext == "app") && app_bundle_has_executable(path);
-    }
-    is_executable_file(path)
+    resolve_executable(path).is_some()
 }
 
+/// Resolves the concrete binary that actually runs when `path` is
+/// launched: `path` itself for a bare executable, or the one found under
+/// `Contents/MacOS` for a `.app` bundle. `None` for anything not runnable
+/// — used both by `is_runnable` (via `.is_some()`) and by callers that
+/// need the real path itself, e.g. to work out what a submitted app's
+/// exec path will look like once copied into the guest (`vm.rs`).
 #[cfg(target_os = "macos")]
-fn app_bundle_has_executable(bundle: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(bundle.join("Contents").join("MacOS")) else {
-        return false;
-    };
-    entries
-        .filter_map(Result::ok)
-        .any(|entry| entry.path().is_file() && is_executable_file(&entry.path()))
+pub fn resolve_executable(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        if path.extension().is_none_or(|ext| ext != "app") {
+            return None;
+        }
+        let entries = std::fs::read_dir(path.join("Contents").join("MacOS")).ok()?;
+        return entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|p| p.is_file() && is_executable_file(p));
+    }
+    is_executable_file(path).then(|| path.to_path_buf())
 }
 
 #[cfg(target_os = "linux")]

@@ -2,6 +2,7 @@ pub mod app_target;
 pub mod cli;
 pub mod decision_engine;
 pub mod download_detection;
+pub mod event_filter;
 pub mod file_type_risk;
 pub mod local_signature;
 pub mod static_analysis;

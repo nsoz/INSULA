@@ -31,6 +31,14 @@
 //! app the user actually submitted. So the app is first copied into an
 //! isolated, per-run staging directory that contains nothing else, and
 //! *that* directory is what gets shared.
+//!
+//! A second, writable `--dir` share carries observation results back the
+//! other way: `insula_sensor` (`src/bin/insula_sensor.rs`, Milestone 4)
+//! appends one JSON line per observed event to a file under it. Unlike
+//! the read-only app-delivery share, this one is deliberately left in
+//! place (not deleted) once `RunningVm` drops — nothing downstream reads
+//! it yet (Milestones 5-6 aren't built), so deleting it on every run would
+//! throw away the only copy of what the sensor just observed.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -41,14 +49,53 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const VNC_READY_PREFIX: &str = "VNC server is running at ";
 
-/// Mount tag for the shared directory — inside the guest this shows up
-/// under `/Volumes/My Shared Files/insula-app`.
+/// Mount tag for the app-delivery directory — inside the guest this shows
+/// up under `/Volumes/My Shared Files/insula-app`.
 const SHARE_TAG: &str = "insula-app";
+
+/// Mount tag for the writable logs directory — inside the guest this
+/// shows up under `/Volumes/My Shared Files/insula-logs`, matching
+/// `insula_sensor.rs`'s `EVENT_LOG_DIR` constant.
+const LOGS_SHARE_TAG: &str = "insula-logs";
+
+/// Where `insula_setup.rs`'s desktop-sync LaunchDaemon copies the
+/// submitted app to, inside the guest — the golden image's default user
+/// is `admin` (`autoLoginUser`, see the `project-insula-vm-tooling`
+/// memory). Shared here so `expected_guest_exec_path` doesn't have to
+/// duplicate a path that already exists as a literal string in that
+/// daemon's shell script.
+pub const GUEST_DESKTOP_DIR: &str = "/Users/admin/Desktop";
+
+/// Works out the absolute path the submitted app will actually be
+/// `execve`'d from once it lands in the guest, for the same reason
+/// `app_target::resolve_executable` exists: a `.app` bundle's literal
+/// `execve` target is the binary under `Contents/MacOS`, not the bundle
+/// folder itself, and desktop-sync copies the whole bundle (preserving
+/// that internal structure) to `GUEST_DESKTOP_DIR`. Used to seed the
+/// event-filtering pass in `event_filter.rs` with "which exec event is
+/// the submitted app actually starting," without hand-duplicating the
+/// bundle-traversal logic `app_target.rs` already has.
+///
+/// Returns `None` for anything `app_target::resolve_executable` itself
+/// wouldn't consider runnable.
+pub fn expected_guest_exec_path(app_path: &Path) -> Option<PathBuf> {
+    let resolved = crate::app_target::resolve_executable(app_path)?;
+    let file_name = app_path.file_name()?;
+    let desktop_copy = Path::new(GUEST_DESKTOP_DIR).join(file_name);
+    match resolved.strip_prefix(app_path) {
+        Ok(relative) if !relative.as_os_str().is_empty() => Some(desktop_copy.join(relative)),
+        _ => Some(desktop_copy),
+    }
+}
 
 pub struct RunningVm {
     child: Child,
     vnc_ready: Receiver<String>,
     staging_dir: PathBuf,
+    /// Where `insula_sensor` writes `events.jsonl` — the host-side end of
+    /// the writable logs share. Not cleaned up in `Drop`; see this file's
+    /// top doc comment for why.
+    logs_dir: PathBuf,
     /// Name of the disposable per-run clone — never the golden image
     /// itself — deleted in `Drop` once this run is over.
     ephemeral_vm_name: String,
@@ -57,11 +104,12 @@ pub struct RunningVm {
 impl RunningVm {
     /// Clones `golden_vm_name` (the `insula_setup`-prepared image) into a
     /// fresh, uniquely-named disposable instance, then spawns `tart run
-    /// <clone> --no-graphics --vnc-experimental --dir insula-app:<staging>:ro`
-    /// against that clone — after first copying `app_path` into a fresh
-    /// staging directory. Fails immediately if cloning, staging the app,
-    /// or spawning `tart` itself fails — does not wait for the VM to
-    /// actually finish booting.
+    /// <clone> --no-graphics --vnc-experimental --dir insula-app:<staging>:ro
+    /// --dir insula-logs:<logs>` against that clone — after first copying
+    /// `app_path` into a fresh staging directory and creating an empty
+    /// logs directory for `insula_sensor` to write into. Fails immediately
+    /// if cloning, staging the app, or spawning `tart` itself fails — does
+    /// not wait for the VM to actually finish booting.
     ///
     /// `auto_open_vnc` should be `true` only for manual exploration, where
     /// the user needs to actually see and drive the VM's screen
@@ -76,20 +124,27 @@ impl RunningVm {
         let staging_dir = stage_app_for_transfer(app_path)?;
         let dir_arg = format!("{SHARE_TAG}:{}:ro", staging_dir.display());
 
-        let ephemeral_vm_name = format!(
-            "insula-run-{}-{}",
+        let unique = format!(
+            "{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or_default()
         );
+        let logs_dir = std::env::temp_dir().join("insula-logs").join(&unique);
+        std::fs::create_dir_all(&logs_dir)?;
+        // No `:ro` — this share needs to be writable from the guest.
+        let logs_dir_arg = format!("{LOGS_SHARE_TAG}:{}", logs_dir.display());
+
+        let ephemeral_vm_name = format!("insula-run-{unique}");
 
         let clone_status = Command::new("tart")
             .args(["clone", golden_vm_name, &ephemeral_vm_name])
             .status()?;
         if !clone_status.success() {
             let _ = std::fs::remove_dir_all(&staging_dir);
+            let _ = std::fs::remove_dir_all(&logs_dir);
             return Err(std::io::Error::other(format!(
                 "tart clone {golden_vm_name} -> {ephemeral_vm_name} failed"
             )));
@@ -103,6 +158,8 @@ impl RunningVm {
                 "--vnc-experimental",
                 "--dir",
                 &dir_arg,
+                "--dir",
+                &logs_dir_arg,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -134,6 +191,7 @@ impl RunningVm {
             child,
             vnc_ready: rx,
             staging_dir,
+            logs_dir,
             ephemeral_vm_name,
         })
     }
@@ -143,6 +201,14 @@ impl RunningVm {
     /// call again on a later tick rather than blocking on it.
     pub fn poll_vnc_url(&self) -> Option<String> {
         self.vnc_ready.try_recv().ok()
+    }
+
+    /// Host-side path to the writable logs share — `insula_sensor` writes
+    /// `events.jsonl` under here. No consumer reads this yet (Milestones
+    /// 5-6 aren't built); exposed now so that work has something real to
+    /// call into instead of re-deriving the path.
+    pub fn logs_dir(&self) -> &Path {
+        &self.logs_dir
     }
 }
 
@@ -310,5 +376,42 @@ mod tests {
 
         std::fs::remove_dir_all(&source_dir).ok();
         std::fs::remove_dir_all(&staging_dir).ok();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn expected_guest_exec_path_for_a_bare_executable_is_its_desktop_copy() {
+        let dir = temp_dir("expected-path-bare");
+        let app_path = dir.join("MyTool");
+        std::fs::File::create(&app_path)
+            .unwrap()
+            .write_all(&[0xfe, 0xed, 0xfa, 0xcf, 0, 0, 0, 0])
+            .unwrap();
+
+        let expected = expected_guest_exec_path(&app_path).unwrap();
+        assert_eq!(expected, Path::new(GUEST_DESKTOP_DIR).join("MyTool"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn expected_guest_exec_path_for_a_bundle_points_at_its_inner_binary() {
+        let dir = temp_dir("expected-path-bundle");
+        let bundle = dir.join("Real.app");
+        let macos_dir = bundle.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos_dir).unwrap();
+        std::fs::File::create(macos_dir.join("Real"))
+            .unwrap()
+            .write_all(&[0xfe, 0xed, 0xfa, 0xcf, 0, 0, 0, 0])
+            .unwrap();
+
+        let expected = expected_guest_exec_path(&bundle).unwrap();
+        assert_eq!(
+            expected,
+            Path::new(GUEST_DESKTOP_DIR).join("Real.app/Contents/MacOS/Real")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -75,14 +75,19 @@ const DESKTOP_SYNC_LAUNCHD_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"
 </plist>
 "#;
 
-const DESKTOP_SYNC_SCRIPT: &str = r#"#!/bin/sh
+/// `DEST` is built from `insula::vm::GUEST_DESKTOP_DIR` (via `format!` in
+/// `desktop_sync_script`, not a literal here) so this stays the single
+/// place that string is duplicated into shell — `vm::expected_guest_exec_path`
+/// relies on this exact destination to work out what a submitted app's
+/// exec path will look like once copied in.
+const DESKTOP_SYNC_SCRIPT_TEMPLATE: &str = r#"#!/bin/sh
 # Insula — copies the submitted app (shared read-only into this VM via
 # Tart's --dir/VirtioFS at boot, see src/vm.rs on the host) onto the
 # admin user's Desktop, so it's immediately visible without anyone having
 # to go find the shared-volume mount themselves.
 
 SHARE="/Volumes/My Shared Files/insula-app"
-DEST="/Users/admin/Desktop"
+DEST="{GUEST_DESKTOP_DIR}"
 
 # The VirtioFS share isn't necessarily mounted the instant this daemon
 # starts at boot — poll briefly rather than failing immediately.
@@ -98,7 +103,13 @@ if [ -d "$SHARE" ]; then
 fi
 "#;
 
+fn desktop_sync_script() -> String {
+    DESKTOP_SYNC_SCRIPT_TEMPLATE.replace("{GUEST_DESKTOP_DIR}", insula::vm::GUEST_DESKTOP_DIR)
+}
+
 fn main() -> anyhow::Result<()> {
+    let force = std::env::args().any(|arg| arg == "--force");
+
     ensure_tart_installed()?;
     ensure_base_image_pulled()?;
     ensure_golden_clone_exists()?;
@@ -106,7 +117,27 @@ fn main() -> anyhow::Result<()> {
     let disk_path = vm_disk_path(GOLDEN_VM_NAME);
 
     if setup_marker_present(&disk_path)? {
-        println!("'{GOLDEN_VM_NAME}' zaten hazır — yapılacak bir şey yok.");
+        if !force {
+            println!(
+                "'{GOLDEN_VM_NAME}' zaten hazır — yapılacak bir şey yok.\n\
+                 Sensör kodu değişti ve golden clone'a yeniden yazılsın istiyorsan:\n\n  \
+                 cargo run --bin insula_setup -- --force\n"
+            );
+            return Ok(());
+        }
+        // SIP-disable is a one-time, disk-persisted state — no need to
+        // walk through Recovery mode again, only the sensor binary and
+        // LaunchDaemons need rewriting. The VM must be stopped for
+        // `install_sensor_and_provisioning`'s host-side disk mount to
+        // work; `guide_through_sip_disable` normally leaves it stopped,
+        // so this path has to do that itself instead.
+        println!(
+            "--force verildi: SIP zaten kapalı olduğu için o adım atlanıyor, \
+             sadece sensör ve LaunchDaemon'lar yeniden yazılıyor..."
+        );
+        let _ = Command::new("tart").args(["stop", GOLDEN_VM_NAME]).status();
+        install_sensor_and_provisioning(&disk_path)?;
+        println!("\nGüncelleme tamamlandı.");
         return Ok(());
     }
 
@@ -244,7 +275,7 @@ fn install_sensor_and_provisioning(disk_path: &Path) -> anyhow::Result<()> {
             "644",
         )?;
         sudo_write_file(
-            DESKTOP_SYNC_SCRIPT,
+            &desktop_sync_script(),
             &insula_dir.join("copy-app-to-desktop.sh"),
             "755",
         )?;
