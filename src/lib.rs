@@ -1,4 +1,5 @@
 pub mod app_target;
+pub mod claude_report;
 pub mod cli;
 pub mod decision_engine;
 pub mod download_detection;

@@ -21,7 +21,10 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
@@ -62,6 +65,37 @@ const CHAR_INTERVAL: Duration = Duration::from_millis(3);
 /// reason.
 const ANIMATION_POLL: Duration = Duration::from_millis(8);
 const IDLE_POLL: Duration = Duration::from_millis(200);
+
+/// How often `Stage::AutoRunning` re-reads and re-filters `events.jsonl`
+/// while waiting on a headless, `ExplorationMode::Unattended` run — far
+/// coarser than `ANIMATION_POLL` since there's no user-facing animation
+/// riding on it, just disk I/O that doesn't need to happen every 8ms.
+const AUTO_RUN_POLL: Duration = Duration::from_millis(500);
+
+/// If the target never even starts executing within this long, the
+/// guest-side auto-run daemon likely failed (or the resolved exec path
+/// was wrong) — give up rather than waiting forever.
+///
+/// **Live-tested and found too short at 30s** (2026-08-16): a real run
+/// timed out with the sensor showing only ~17s of captured boot noise —
+/// the target never got a chance to start. The guest side has its own
+/// chained worst-case latency this has to outlast: the VM's own boot
+/// (`vm.rs`'s doc comment already notes "tens of seconds"), *then*
+/// desktop-sync's own up-to-30s wait for its share to mount plus however
+/// long the actual copy takes (the `EncryptApp` binaries tested this
+/// session were ~80MB, self-contained .NET), *then* auto-run's own two
+/// sequential wait loops (marker, then target file) on top of that.
+/// 180s gives real slack across that whole chain instead of a number
+/// picked before any of it was measured.
+const AUTO_RUN_START_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// If the target started but produces no new sensor events (process or
+/// file) for this long without exiting, treat it as stuck — an infinite
+/// loop, a wait on input that will never come, or similar — rather than
+/// waiting forever. Deliberately based on *sensor activity*, not wall
+/// clock since launch, so a slow-but-genuinely-working run isn't
+/// mistaken for a hang.
+const AUTO_RUN_HANG_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Dispatches to whichever watermark implementation actually gets a smooth
 /// live resize out of the current terminal. `KittyMark` transmits the mark
@@ -220,8 +254,7 @@ struct VmLaunch {
 
 impl VmLaunch {
     fn launch(vm_name: &str, app_path: &std::path::Path, mode: ExplorationMode) -> Self {
-        let auto_open_vnc = matches!(mode, ExplorationMode::Manual);
-        match RunningVm::launch(vm_name, app_path, auto_open_vnc) {
+        match RunningVm::launch(vm_name, app_path, mode) {
             Ok(vm) => Self {
                 vm: Some(vm),
                 vnc_url: None,
@@ -263,10 +296,10 @@ impl VmLaunch {
     fn status_line(&self) -> String {
         match (&self.vnc_url, &self.error) {
             (Some(url), _) => {
-                format!("VM açıldı, uygulama paylaşımlı dizin üzerinden erişilebilir — VNC: {url}")
+                format!("VM is up, the app is accessible via the shared directory — VNC: {url}")
             }
-            (None, Some(err)) => format!("VM açılamadı: {err}"),
-            (None, None) => "VM açılıyor, uygulama VM'e aktarılıyor...".to_string(),
+            (None, Some(err)) => format!("VM failed to start: {err}"),
+            (None, None) => "VM is starting, transferring the app into it...".to_string(),
         }
     }
 }
@@ -284,10 +317,40 @@ impl VmLaunch {
 enum Stage {
     Onboarding(Onboarding),
     Notifying {
-        answers: Answers,
         messages: Vec<String>,
         shown: usize,
         last_tick: Instant,
+        spinner_tick: usize,
+    },
+    /// `ExplorationMode::Unattended` only: no window is ever shown to
+    /// the user (see `RunningVm::launch`'s `auto_open_vnc`) — instead this
+    /// polls `events.jsonl` (via `AUTO_RUN_POLL`) for the target's own
+    /// `exec`, watching for it to `exit` (success), never start within
+    /// `AUTO_RUN_START_TIMEOUT`, or start but go quiet for longer than
+    /// `AUTO_RUN_HANG_TIMEOUT` without exiting (stuck — an infinite loop
+    /// or a wait on input that will never come). Whichever happens first
+    /// triggers `finish_analysis` on its own, no Esc required — see
+    /// `advance_stage`.
+    AutoRunning {
+        /// Learned from the first matching `exec` event once the target
+        /// actually starts; `None` until then.
+        target_pid: Option<i64>,
+        started_at: Instant,
+        /// Bumped forward every time a *new* sensor event for this
+        /// target's process tree appears — the hang-detection clock runs
+        /// off this, not off `started_at`, so a slow-but-genuinely-busy
+        /// run isn't mistaken for a stall.
+        last_activity_at: Instant,
+        last_event_count: usize,
+        spinner_tick: usize,
+    },
+    /// Between "the run is over" (Esc, or `AutoRunning` finishing on its
+    /// own) and the real report existing — the Claude API call runs on a
+    /// background thread (see `finish_analysis`) so the network round-trip
+    /// never freezes the render loop, the same pattern `VmLaunch` already
+    /// uses for the VNC-URL wait.
+    GeneratingReport {
+        rx: mpsc::Receiver<Vec<String>>,
         spinner_tick: usize,
     },
     Streaming {
@@ -317,10 +380,26 @@ fn run(
     // notification sequence finished, seconds after it opened. Scoping it
     // here instead means it only tears down when `run` itself returns.
     let mut vm: Option<VmLaunch> = None;
+    // Set alongside `vm` when the VM launches, kept around through every
+    // later stage (unlike `Answers`, which `Stage::Streaming`/`Interactive`
+    // don't carry) so `finish_analysis` still knows what to resolve
+    // `vm::expected_guest_exec_path` against once the user is done.
+    let mut target_app_path: Option<PathBuf> = None;
+    // Set alongside `target_app_path` — `advance_stage` needs it to know
+    // whether a finished `Notifying` ticker should sit idle (Manual, wait
+    // for the user's Esc) or auto-transition into `Stage::AutoRunning`
+    // (Unattended, no human ever touches this VM).
+    let mut exploration_mode: Option<ExplorationMode> = None;
 
     loop {
         watermark.poll_resize_result();
-        advance_stage(&mut stage, &mut vm, &mut command_line);
+        advance_stage(
+            &mut stage,
+            &mut vm,
+            &mut command_line,
+            target_app_path.as_deref(),
+            exploration_mode,
+        );
 
         terminal.draw(|frame| {
             let area = frame.area();
@@ -373,6 +452,42 @@ fn run(
                     }
                     .render(frame, panel_area);
                 }
+                Stage::AutoRunning {
+                    target_pid,
+                    spinner_tick,
+                    ..
+                } => {
+                    let [watermark_area, panel_area] = Layout::vertical([
+                        Constraint::Min(0),
+                        Constraint::Length(insula::cli::notify::HEIGHT),
+                    ])
+                    .areas(area);
+                    watermark.render(frame, watermark_area);
+                    let current = match target_pid {
+                        Some(pid) => format!("App is running in the background (pid {pid}), observing..."),
+                        None => "Starting the app in the background...".to_string(),
+                    };
+                    Notifications {
+                        past: &[],
+                        current: Some(&current),
+                        spinner_tick: *spinner_tick,
+                    }
+                    .render(frame, panel_area);
+                }
+                Stage::GeneratingReport { spinner_tick, .. } => {
+                    let [watermark_area, panel_area] = Layout::vertical([
+                        Constraint::Min(0),
+                        Constraint::Length(insula::cli::notify::HEIGHT),
+                    ])
+                    .areas(area);
+                    watermark.render(frame, watermark_area);
+                    Notifications {
+                        past: &[],
+                        current: Some("Claude is interpreting the observations..."),
+                        spinner_tick: *spinner_tick,
+                    }
+                    .render(frame, panel_area);
+                }
                 Stage::Streaming { .. } | Stage::Interactive => {
                     // Reserve the bottom region for the command line
                     // *before* the watermark ever sees the frame area, so
@@ -397,26 +512,39 @@ fn run(
         })?;
 
         let poll_timeout = match stage {
-            Stage::Notifying { .. } | Stage::Streaming { .. } => ANIMATION_POLL,
+            Stage::Notifying { .. } | Stage::GeneratingReport { .. } | Stage::Streaming { .. } => {
+                ANIMATION_POLL
+            }
+            Stage::AutoRunning { .. } => AUTO_RUN_POLL,
             Stage::Onboarding(_) | Stage::Interactive => IDLE_POLL,
         };
         if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.code == KeyCode::Esc {
+                        // First Esc while a VM is still up tears it down and
+                        // shows what was actually observed instead of
+                        // quitting outright — see `finish_analysis`. Once
+                        // there's nothing left to finish (already torn down,
+                        // or the launch never produced a VM at all), Esc
+                        // goes back to just quitting.
+                        if finish_analysis(&mut vm, target_app_path.as_deref(), None, &mut stage) {
+                            continue;
+                        }
                         return Ok(());
                     }
                     match &mut stage {
                         Stage::Onboarding(onboarding) => {
                             if let Some(answers) = onboarding.handle_key(key) {
                                 let messages = notification_messages(&answers);
+                                target_app_path = Some(PathBuf::from(&answers.path));
+                                exploration_mode = Some(answers.mode);
                                 vm = Some(VmLaunch::launch(
                                     GOLDEN_VM_NAME,
-                                    std::path::Path::new(&answers.path),
+                                    Path::new(&answers.path),
                                     answers.mode,
                                 ));
                                 stage = Stage::Notifying {
-                                    answers,
                                     messages,
                                     shown: 0,
                                     last_tick: Instant::now(),
@@ -424,7 +552,10 @@ fn run(
                                 };
                             }
                         }
-                        Stage::Notifying { .. } | Stage::Streaming { .. } => {}
+                        Stage::Notifying { .. }
+                        | Stage::AutoRunning { .. }
+                        | Stage::GeneratingReport { .. }
+                        | Stage::Streaming { .. } => {}
                         Stage::Interactive => {
                             command_line.handle_key(key);
                         }
@@ -442,12 +573,96 @@ fn run(
 }
 
 /// Drives the timer-based transitions between stages: advancing the
-/// notification ticker, streaming report lines into `command_line`'s real
-/// history, and moving to the next stage once each phase runs out of
+/// notification ticker, polling a headless `Unattended` run for
+/// completion/hang/crash, streaming report lines into `command_line`'s
+/// real history, and moving to the next stage once each phase runs out of
 /// content. Split from rendering so the borrow of whichever `Stage` variant
 /// is active never overlaps with reassigning `*stage` itself.
-fn advance_stage(stage: &mut Stage, vm: &mut Option<VmLaunch>, command_line: &mut CommandLine) {
+fn advance_stage(
+    stage: &mut Stage,
+    vm: &mut Option<VmLaunch>,
+    command_line: &mut CommandLine,
+    target_app_path: Option<&Path>,
+    exploration_mode: Option<ExplorationMode>,
+) {
+    // Populated inside the match below (which borrows `stage`) and acted
+    // on after it ends, mirroring the notifying_done/streaming_done
+    // transition checks further down — `*stage` can't be reassigned while
+    // still borrowed by the arm that's deciding to reassign it.
+    let mut generated_report: Option<Vec<String>> = None;
+    // Set when `AutoRunning`'s polling decides the run is over (target
+    // exited, never started, or went quiet too long) — holds the Turkish
+    // finding text `finish_analysis` folds into the report.
+    let mut generated_finish: Option<String> = None;
+
     match stage {
+        Stage::GeneratingReport { rx, spinner_tick, .. } => {
+            *spinner_tick = spinner_tick.wrapping_add(1);
+            if let Ok(lines) = rx.try_recv() {
+                generated_report = Some(lines);
+            }
+        }
+        Stage::AutoRunning {
+            target_pid,
+            started_at,
+            last_activity_at,
+            last_event_count,
+            spinner_tick,
+        } => {
+            *spinner_tick = spinner_tick.wrapping_add(1);
+            if let Some(events) = vm.as_ref().and_then(|v| {
+                let running = v.vm.as_ref()?;
+                let target = target_app_path?;
+                let exec_path = insula::vm::expected_guest_exec_path(target)?;
+                let raw = std::fs::read_to_string(running.logs_dir().join("events.jsonl"))
+                    .unwrap_or_default();
+                Some(insula::event_filter::filter_for_target(
+                    &raw,
+                    &exec_path.to_string_lossy(),
+                ))
+            }) {
+                if events.len() != *last_event_count {
+                    *last_event_count = events.len();
+                    *last_activity_at = Instant::now();
+                }
+                if target_pid.is_none()
+                    && let Some(pid) = events.first().and_then(|e| e["pid"].as_i64())
+                {
+                    *target_pid = Some(pid);
+                }
+
+                let exit_status = target_pid.and_then(|pid| {
+                    events
+                        .iter()
+                        .find(|e| e["type"] == "exit" && e["pid"].as_i64() == Some(pid))
+                        .and_then(|e| e["status"].as_i64())
+                });
+
+                generated_finish = if let Some(status) = exit_status {
+                    Some(format!(
+                        "The target app exited on its own (pid {}, exit status: {status}).",
+                        target_pid.unwrap_or(-1)
+                    ))
+                } else if target_pid.is_none() && started_at.elapsed() > AUTO_RUN_START_TIMEOUT {
+                    Some(format!(
+                        "The target app never started within {} seconds — the auto-run daemon \
+                         may have failed, or the app isn't running from the expected path.",
+                        AUTO_RUN_START_TIMEOUT.as_secs()
+                    ))
+                } else if target_pid.is_some() && last_activity_at.elapsed() > AUTO_RUN_HANG_TIMEOUT
+                {
+                    Some(format!(
+                        "The target app (pid {}) started but hasn't produced any new events for \
+                         {} seconds and hasn't exited — it's likely stuck in an infinite loop or \
+                         waiting on input that will never arrive.",
+                        target_pid.unwrap_or(-1),
+                        AUTO_RUN_HANG_TIMEOUT.as_secs()
+                    ))
+                } else {
+                    None
+                };
+            }
+        }
         Stage::Notifying {
             messages,
             shown,
@@ -497,17 +712,36 @@ fn advance_stage(stage: &mut Stage, vm: &mut Option<VmLaunch>, command_line: &mu
         Stage::Onboarding(_) | Stage::Interactive => {}
     }
 
-    let notifying_done = matches!(
-        stage,
-        Stage::Notifying { messages, shown, .. } if *shown > messages.len()
-    );
-    if notifying_done && let Stage::Notifying { answers, .. } = stage {
-        let remaining_lines: VecDeque<String> = build_report_lines(answers).into();
+    if let Some(lines) = generated_report {
         *stage = Stage::Streaming {
-            remaining_lines,
+            remaining_lines: lines.into(),
             current_chars: VecDeque::new(),
             current_line_active: false,
             last_tick: Instant::now(),
+        };
+    }
+
+    if let Some(finding) = generated_finish {
+        finish_analysis(vm, target_app_path, Some(finding), stage);
+    }
+
+    // `Notifying`'s ticker plays through its canned messages once, then:
+    // `Manual` just holds on the last one — the VM stays up and the user
+    // is free to explore it for as long as they want, `Stage::Streaming`
+    // only ever entered via `finish_analysis` (Esc) from here on.
+    // `Unattended` instead auto-transitions into `Stage::AutoRunning` —
+    // nobody is watching this VM, so there's nothing to hold for.
+    let notifying_ticker_done = matches!(
+        stage,
+        Stage::Notifying { messages, shown, .. } if *shown > messages.len()
+    );
+    if notifying_ticker_done && exploration_mode == Some(ExplorationMode::Unattended) {
+        *stage = Stage::AutoRunning {
+            target_pid: None,
+            started_at: Instant::now(),
+            last_activity_at: Instant::now(),
+            last_event_count: 0,
+            spinner_tick: 0,
         };
     }
 
@@ -521,106 +755,181 @@ fn advance_stage(stage: &mut Stage, vm: &mut Option<VmLaunch>, command_line: &mu
     }
 }
 
-/// The fake "exploring" status line shown after the real VM-launch line
-/// (`VmLaunch::status_line`, which already covers the app transfer — see
-/// its docs) while `Stage::Notifying` is active — standing in for the
-/// real Milestone 4 exploration pipeline, which doesn't exist yet.
+/// The status line shown after the real VM-launch line (`VmLaunch::status_line`,
+/// which already covers the app transfer — see its docs) while
+/// `Stage::Notifying` is active. The second line is an instruction, not a
+/// claim that a report is already being produced — nothing happens
+/// automatically anymore, see `finish_analysis`.
 fn notification_messages(answers: &Answers) -> Vec<String> {
     vec![
         match answers.mode {
             ExplorationMode::Manual => {
-                "VM hazır — uygulamayı VM içinde kendiniz keşfedebilirsiniz.".to_string()
+                "VM is ready — you can explore the app yourself inside it.".to_string()
             }
-            ExplorationMode::ClaudeAgentic => {
-                "Claude, erişilebilirlik ağacı üzerinden uygulamayı VM içinde inceliyor..."
-                    .to_string()
+            ExplorationMode::Unattended => {
+                "Running the app unattended in the background and observing it...".to_string()
             }
         },
-        "Gözlem tamamlandı, rapor hazırlanıyor...".to_string(),
+        "When you're done exploring, come back here and press Esc — the observation report will be prepared.".to_string(),
     ]
 }
 
-/// A placeholder report, clearly labeled as such — Milestones 3-6 (the real
-/// VM/observation/report pipeline) don't exist yet. Only here to exercise
-/// the line-by-line streaming into `command_line`'s history, which is what
-/// actually drives the watermark's upward shrink.
-fn build_report_lines(answers: &Answers) -> Vec<String> {
-    let mode_label = match answers.mode {
-        ExplorationMode::Manual => "Manuel",
-        ExplorationMode::ClaudeAgentic => "Claude",
+/// Tears the VM down (if one is still up) and switches `stage` into
+/// `Stage::GeneratingReport`, which builds the real report — including a
+/// Claude API call — on a background thread rather than blocking the
+/// render loop. Returns `false` (does nothing) if there's no active VM to
+/// finish — either the launch never produced one, or a previous call to
+/// this function already did the teardown — so the caller knows to let
+/// Esc actually quit instead.
+fn finish_analysis(
+    vm: &mut Option<VmLaunch>,
+    target_app_path: Option<&Path>,
+    auto_finding: Option<String>,
+    stage: &mut Stage,
+) -> bool {
+    let Some(running_vm) = vm.as_mut().and_then(|v| v.vm.take()) else {
+        return false;
     };
-    vec![
-        String::new(),
-        format!("=== Insula Gözlem Raporu — {} ===", answers.path),
-        String::new(),
-        "Gözlem penceresi: VM boot'undan itibaren kesintisiz, transfer ve keşif dahil tek parça."
+    // Read the logs path out before dropping — `Drop` tears the VM down
+    // (and its staging dir) but deliberately leaves `logs_dir` itself on
+    // disk, see `vm.rs`'s module doc comment for why.
+    let logs_dir = running_vm.logs_dir().to_path_buf();
+    drop(running_vm);
+
+    let target_app_path = target_app_path.map(Path::to_path_buf);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let lines =
+            build_real_report_lines(&logs_dir, target_app_path.as_deref(), auto_finding.as_deref());
+        let _ = tx.send(lines);
+    });
+
+    *stage = Stage::GeneratingReport { rx, spinner_tick: 0 };
+    true
+}
+
+/// Builds the report from `insula_sensor`'s real, captured `events.jsonl`,
+/// filtered down to just the submitted app's own process tree via
+/// `event_filter::filter_for_target` — see that module's docs for why
+/// filtering happens here (downstream, after the fact) rather than live in
+/// the sensor. `auto_finding` carries `Stage::AutoRunning`'s own
+/// completion/timeout/hang verdict (`None` for a manual, Esc-ended run) —
+/// a hard fact from sensor data, not something that needs an LLM to
+/// determine, so it's surfaced directly rather than left for Claude to
+/// re-guess from the raw events alone.
+fn build_real_report_lines(
+    logs_dir: &Path,
+    target_app_path: Option<&Path>,
+    auto_finding: Option<&str>,
+) -> Vec<String> {
+    let mut lines = vec![String::new()];
+
+    let Some(target_app_path) = target_app_path else {
+        lines.push("Couldn't generate the observation report: the target app path is missing.".to_string());
+        return lines;
+    };
+    lines.push(format!(
+        "=== Insula Observation Report — {} ===",
+        target_app_path.display()
+    ));
+    lines.push(String::new());
+
+    if let Some(finding) = auto_finding {
+        lines.push("-- Auto-Run Finding --".to_string());
+        lines.push(finding.to_string());
+        lines.push(String::new());
+    }
+
+    let Some(target_exec_path) = insula::vm::expected_guest_exec_path(target_app_path) else {
+        lines.push(
+            "This path doesn't look like a runnable app, events couldn't be filtered."
+                .to_string(),
+        );
+        return lines;
+    };
+    let target_exec_path = target_exec_path.to_string_lossy().into_owned();
+
+    let raw = std::fs::read_to_string(logs_dir.join("events.jsonl")).unwrap_or_default();
+    let events = insula::event_filter::filter_for_target(&raw, &target_exec_path);
+
+    lines.push(format!("Target exec path (inside the VM): {target_exec_path}"));
+    lines.push(format!("Total observed events: {}", events.len()));
+    lines.push(String::new());
+
+    if events.is_empty() {
+        lines.push(
+            "No record was found of the target app ever running — this is normal if you"
+                .to_string(),
+        );
+        lines.push(
+            "never started the app inside the VM, or the VM was closed before the sensor"
+                .to_string(),
+        );
+        lines.push("was ready.".to_string());
+        return lines;
+    }
+
+    match insula::claude_report::narrate(&events, target_app_path, auto_finding.map(str::to_string)) {
+        Ok(narrative) => {
+            lines.push("-- Claude Analysis --".to_string());
+            lines.extend(narrative);
+        }
+        Err(reason) => {
+            lines.push(format!(
+                "-- Note: couldn't get a Claude analysis ({reason}) — showing the raw timeline instead --"
+            ));
+            lines.push(String::new());
+            lines.push("-- Timeline --".to_string());
+            let base_time = events[0]["time_unix_secs"].as_i64().unwrap_or(0);
+            for event in &events {
+                let offset = event["time_unix_secs"].as_i64().unwrap_or(base_time) - base_time;
+                lines.push(format!("+{offset:>3}s  {}", describe_event(event)));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("-- Note --".to_string());
+    lines.push(
+        "This report is based solely on real events belonging to the target app's own"
             .to_string(),
-        format!("Keşif modu: {mode_label}"),
-        "Toplam gözlem süresi: 00:04:37".to_string(),
-        String::new(),
-        "-- Özet --".to_string(),
-        "Uygulama başlangıçta beklenen dosya/dizin erişimlerini yaptı; ardından amacıyla"
-            .to_string(),
-        "doğrudan ilişkisi görünmeyen birkaç sistem sorgusu ve bir ağ bağlantı denemesi"
-            .to_string(),
-        "gözlemlendi. Aşağıdaki zaman çizelgesi ve anomali bölümü bunları ayrı ayrı listeliyor."
-            .to_string(),
-        String::new(),
-        "-- Statik Yapı Profili --".to_string(),
-        "Dosya türü: Mach-O 64-bit executable (arm64)".to_string(),
-        "İmzalama: ad-hoc, tanınan bir yayıncı sertifikası yok.".to_string(),
-        "Entitlement'lar: com.apple.security.network.client, sandbox devre dışı.".to_string(),
-        "Bölüm entropisi: __TEXT 5.9, __DATA 4.1, __LINKEDIT 6.2 — paketleme belirtisi yok."
-            .to_string(),
-        "Bağlı kütüphaneler: libSystem, CoreFoundation, Security, libcurl.".to_string(),
-        "Gömülü stringler arasında 2 URL, 1 API anahtarı benzeri yüksek entropili dizgi var."
-            .to_string(),
-        String::new(),
-        "-- Davranış Zaman Çizelgesi --".to_string(),
-        "00:00:02  Süreç başlatıldı, ana thread çalışmaya başladı.".to_string(),
-        "00:00:03  Dosya: kendi bulunduğu dizini okudu (kod imzası doğrulama olabilir)."
-            .to_string(),
-        "00:00:05  Sistem: toplam çalışma süresi (uptime) sorgulandı.".to_string(),
-        "00:00:07  Dosya: kullanıcının Belgeler klasörü listelendi.".to_string(),
-        "00:00:09  Dosya: Masaüstü klasörü listelendi (uygulamanın amacıyla ilişkisi belirsiz)."
-            .to_string(),
-        "00:00:12  Süreç: adı bilinmeyen bir yardımcı süreç başlatıldı, kısa sürede sonlandı."
-            .to_string(),
-        "00:00:18  Ağ: dış bir sunucuya bağlantı denemesi (yanıt yok, VM izole).".to_string(),
-        "00:00:26  Sistem: yüklü uygulamalar listesi sorgulandı (VM/analiz araçları dahil)."
-            .to_string(),
-        "00:00:41  Dosya: geçici dizine küçük bir dosya yazıldı, ardından silindi.".to_string(),
-        "00:01:03  Süreç kendi çalışma sayacını (run-count) okudu, artırdı, kapattı.".to_string(),
-        String::new(),
-        "-- Anomali / Kaçınma Sinyalleri --".to_string(),
-        "[dikkat] Yüklü uygulama taraması, bilinen sanallaştırma/analiz araçlarının adlarını"
-            .to_string(),
-        "         içeriyordu — VM tespiti amaçlı olabilir.".to_string(),
-        "[dikkat] Çalışma sayacı okuma+artırma döngüsü, gecikmeli tetikleyici (delayed-trigger)"
-            .to_string(),
-        "         davranışıyla tutarlı; bu oturumda payload tetiklenmedi.".to_string(),
-        "[bilgi]  Masaüstü klasörü taraması, uygulamanın belirttiği amaçla doğrudan ilişkili"
-            .to_string(),
-        "         görünmüyor — amaç dışı numaralandırma (irrelevant enumeration).".to_string(),
-        String::new(),
-        "-- Bilinen Desen Eşleşmeleri --".to_string(),
-        "Yüksek entropili gömülü dizgi, bilinen bir ticari çökme-raporlama SDK'sının anahtar"
-            .to_string(),
-        "biçimiyle kısmen örtüşüyor (orta güven).".to_string(),
-        String::new(),
-        "-- Çıkarılan Yapı Taslağı (deneysel) --".to_string(),
-        "[doğrulanmış]  Ağ bağlantı denemesi sabit bir host:port çiftine yapılıyor — 3 farklı"
-            .to_string(),
-        "               girdiyle tekrarlanan testte davranış değişmedi.".to_string(),
-        "[çıkarım]      Çalışma sayacı belirli bir eşiği geçtiğinde ek bir davranışın".to_string(),
-        "               tetiklenebileceği düşünülüyor; bu oturumda doğrulanamadı.".to_string(),
-        String::new(),
-        "-- Not --".to_string(),
-        "Bu gerçek bir VM oturumu değil; CLI akışını göstermek için yer tutucu bir örnek"
-            .to_string(),
-        "rapordur. Gerçek gözlem/rapor motoru Milestone 3-6 kapsamında henüz yazılmadı."
-            .to_string(),
-        String::new(),
-        "Bu kanıtlarla ilgili sorularınızı aşağıya yazabilirsiniz.".to_string(),
-    ]
+    );
+    lines.push("process tree, filtered (via event_filter) from the raw sensor log.".to_string());
+
+    lines
+}
+
+/// Plain-language description of one filtered event, matched by `"type"`
+/// — mirrors the event shapes `insula_sensor.rs`'s `describe_event`
+/// actually produces.
+fn describe_event(event: &serde_json::Value) -> String {
+    let pid = event["pid"].as_i64().unwrap_or(-1);
+    match event["type"].as_str().unwrap_or("") {
+        "exec" => format!(
+            "Process started (pid {pid}): {}",
+            event["path"].as_str().unwrap_or("?")
+        ),
+        "fork" => format!(
+            "New process spawned (pid {pid} → child {})",
+            event["child_pid"].as_i64().unwrap_or(-1)
+        ),
+        "exit" => format!(
+            "Process exited (pid {pid}), exit status: {}",
+            event["status"].as_i64().unwrap_or(-1)
+        ),
+        "create" => format!(
+            "File created (pid {pid}): {}",
+            event["path"].as_str().unwrap_or("?")
+        ),
+        "rename" => format!(
+            "File renamed (pid {pid}): {} → {}",
+            event["source_path"].as_str().unwrap_or("?"),
+            event["destination_path"].as_str().unwrap_or("?"),
+        ),
+        "unlink" => format!(
+            "File deleted (pid {pid}): {}",
+            event["path"].as_str().unwrap_or("?")
+        ),
+        other => format!("Unknown event type ({other}), pid {pid}"),
+    }
 }

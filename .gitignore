@@ -15,3 +15,10 @@
 .env.*
 *.pem
 *.key
+
+# Test payloads used to live-test the sensor/auto-run pipeline against
+# real file-encrypting behavior — functional, ~76MB self-contained .NET
+# binaries. Deliberately included (not ignored) so anyone cloning the repo
+# has a real ransomware-like sample to test Insula against — shipped with
+# execute permission stripped (chmod a-x) as the safety default; see the
+# README before touching them.

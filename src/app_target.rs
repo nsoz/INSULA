@@ -32,12 +32,12 @@ impl AppTargetError {
     /// onboarding prompt.
     pub fn message(self) -> &'static str {
         match self {
-            Self::NotFound => "Bu yolda bir dosya veya uygulama bulunamadı.",
+            Self::NotFound => "No file or app was found at this path.",
             Self::NotRunnable => {
-                "Bu, bu işletim sisteminde çalıştırılabilir bir uygulama gibi görünmüyor."
+                "This doesn't look like an app that can run on this operating system."
             }
             Self::UnsupportedHostOs => {
-                "Bu işletim sistemi için henüz destek yok (v1: yalnızca macOS ve Linux)."
+                "This operating system isn't supported yet (v1: macOS and Linux only)."
             }
         }
     }

@@ -47,6 +47,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cli::onboarding::ExplorationMode;
+
 const VNC_READY_PREFIX: &str = "VNC server is running at ";
 
 /// Mount tag for the app-delivery directory — inside the guest this shows
@@ -57,6 +59,17 @@ const SHARE_TAG: &str = "insula-app";
 /// shows up under `/Volumes/My Shared Files/insula-logs`, matching
 /// `insula_sensor.rs`'s `EVENT_LOG_DIR` constant.
 const LOGS_SHARE_TAG: &str = "insula-logs";
+
+/// Filename of the auto-run signal, written into the writable logs share
+/// (never the read-only app share — that one gets blanket-copied onto the
+/// guest's Desktop by `insula_setup.rs`'s desktop-sync daemon, which would
+/// otherwise leak this control file there too). Its presence, plus its
+/// content (the resolved guest exec path — see `expected_guest_exec_path`),
+/// is how `ExplorationMode::Unattended` tells the guest-side auto-run
+/// LaunchDaemon (`insula_setup.rs`) to launch the submitted app itself,
+/// without a human ever touching the VM. Manual-mode runs never write
+/// this file, so that daemon just idles and exits for them.
+const AUTO_RUN_MARKER: &str = ".insula-auto-run";
 
 /// Where `insula_setup.rs`'s desktop-sync LaunchDaemon copies the
 /// submitted app to, inside the guest — the golden image's default user
@@ -111,16 +124,17 @@ impl RunningVm {
     /// if cloning, staging the app, or spawning `tart` itself fails — does
     /// not wait for the VM to actually finish booting.
     ///
-    /// `auto_open_vnc` should be `true` only for manual exploration, where
-    /// the user needs to actually see and drive the VM's screen
-    /// themselves once it's ready — for Claude-driven exploration, Claude
-    /// is the one connecting over VNC, so there's no reason to also pop
-    /// open a visible Screen Sharing window for the user.
-    pub fn launch(
-        golden_vm_name: &str,
-        app_path: &Path,
-        auto_open_vnc: bool,
-    ) -> std::io::Result<Self> {
+    /// For `ExplorationMode::Manual`, the user needs to actually see and
+    /// drive the VM's screen themselves once it's ready, so this
+    /// auto-opens Screen Sharing. For `ExplorationMode::Unattended`, no
+    /// window is opened — instead, the resolved guest exec path is
+    /// written into the writable logs share as `AUTO_RUN_MARKER`, which
+    /// the guest-side auto-run LaunchDaemon (`insula_setup.rs`) picks up
+    /// and launches on its own, headlessly. Nothing here waits for that
+    /// to happen — see `event_filter`/`insula_cli`'s polling of
+    /// `logs_dir()/events.jsonl` for how completion is actually detected.
+    pub fn launch(golden_vm_name: &str, app_path: &Path, mode: ExplorationMode) -> std::io::Result<Self> {
+        let auto_open_vnc = matches!(mode, ExplorationMode::Manual);
         let staging_dir = stage_app_for_transfer(app_path)?;
         let dir_arg = format!("{SHARE_TAG}:{}:ro", staging_dir.display());
 
@@ -136,6 +150,18 @@ impl RunningVm {
         std::fs::create_dir_all(&logs_dir)?;
         // No `:ro` — this share needs to be writable from the guest.
         let logs_dir_arg = format!("{LOGS_SHARE_TAG}:{}", logs_dir.display());
+
+        if mode == ExplorationMode::Unattended
+            && let Some(exec_path) = expected_guest_exec_path(app_path)
+        {
+            // Best-effort: if this write fails, the guest daemon simply
+            // never finds the marker and idles — same as manual mode,
+            // not a launch failure worth aborting over.
+            let _ = std::fs::write(
+                logs_dir.join(AUTO_RUN_MARKER),
+                exec_path.to_string_lossy().as_bytes(),
+            );
+        }
 
         let ephemeral_vm_name = format!("insula-run-{unique}");
 

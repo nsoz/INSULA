@@ -26,7 +26,7 @@ pub const HEIGHT: u16 = 9;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExplorationMode {
     Manual,
-    ClaudeAgentic,
+    Unattended,
 }
 
 enum Step {
@@ -97,12 +97,12 @@ impl Onboarding {
             Step::Mode { selected } => match key.code {
                 KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                     *selected = match selected {
-                        ExplorationMode::Manual => ExplorationMode::ClaudeAgentic,
-                        ExplorationMode::ClaudeAgentic => ExplorationMode::Manual,
+                        ExplorationMode::Manual => ExplorationMode::Unattended,
+                        ExplorationMode::Unattended => ExplorationMode::Manual,
                     };
                 }
                 KeyCode::Char('1') => *selected = ExplorationMode::Manual,
-                KeyCode::Char('2') => *selected = ExplorationMode::ClaudeAgentic,
+                KeyCode::Char('2') => *selected = ExplorationMode::Unattended,
                 KeyCode::Enter => {
                     return Some(Answers {
                         path: std::mem::take(&mut self.input),
@@ -119,30 +119,30 @@ impl Onboarding {
         let lines: Vec<Line> = match &self.step {
             Step::Welcome => vec![
                 Line::from(Span::styled(
-                    "Insula'ya hoş geldiniz.",
+                    "Welcome to Insula.",
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "İncelemek istediğiniz uygulamayı izole bir VM içinde çalıştırıp",
+                    "I'll run the app you want to examine inside an isolated VM",
                     Style::default().fg(Color::Gray),
                 )),
                 Line::from(Span::styled(
-                    "ne yaptığını sizin için gözlemleyeceğim.",
+                    "and observe what it does for you.",
                     Style::default().fg(Color::Gray),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Devam etmek için Enter'a basın.",
+                    "Press Enter to continue.",
                     Style::default().fg(Color::DarkGray),
                 )),
             ],
             Step::Path { error } => {
                 let mut lines = vec![
                     Line::from(Span::styled(
-                        "Çalıştırılmak istenen uygulamanın yolu nedir?",
+                        "What's the path to the app you want to run?",
                         Style::default().fg(Color::White),
                     )),
                     Line::from(""),
@@ -172,21 +172,21 @@ impl Onboarding {
                 };
                 vec![
                     Line::from(Span::styled(
-                        "İnceleme nasıl yapılsın?",
+                        "How should the exploration happen?",
                         Style::default().fg(Color::White),
                     )),
                     Line::from(""),
                     option(
                         ExplorationMode::Manual,
-                        "[1] Manuel \u{2014} uygulamayı VM içinde siz kullanın",
+                        "[1] Manual \u{2014} you use the app yourself inside the VM",
                     ),
                     option(
-                        ExplorationMode::ClaudeAgentic,
-                        "[2] Claude \u{2014} erişilebilirlik ağacı üzerinden Claude keşfetsin",
+                        ExplorationMode::Unattended,
+                        "[2] Unattended \u{2014} run it in the background and observe, no VM window",
                     ),
                     Line::from(""),
                     Line::from(Span::styled(
-                        "Seçmek için \u{2191}/\u{2193} veya 1/2, onaylamak için Enter.",
+                        "\u{2191}/\u{2193} or 1/2 to select, Enter to confirm.",
                         Style::default().fg(Color::DarkGray),
                     )),
                 ]

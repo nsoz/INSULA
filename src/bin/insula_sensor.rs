@@ -102,11 +102,11 @@ fn main() {
         // read and converted to an owned `String`/`serde_json::Value`
         // before the handler returns, nothing borrowed from it escapes.
         let described = unsafe { describe_event(&*message) };
-        if let Some(line) = described {
-            if let Ok(mut log) = log.lock() {
-                let _ = writeln!(log, "{line}");
-                let _ = log.flush();
-            }
+        if let Some(line) = described
+            && let Ok(mut log) = log.lock()
+        {
+            let _ = writeln!(log, "{line}");
+            let _ = log.flush();
         }
     });
 
