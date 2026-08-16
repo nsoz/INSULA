@@ -1,4 +1,4 @@
-# Insula
+# INSULΛ
 
 *Insula* — Latin for "island."
 
